@@ -1,3 +1,5 @@
+#![windows_subsystem = "windows"]
+
 //! `my-tray-app` – a headless system-tray daemon.
 //!
 //! Architecture
@@ -138,35 +140,51 @@ fn build_tray_icon(cmd_tx: Sender<AppCommand>) -> tray_icon::TrayIcon {
         .expect("failed to build tray icon")
 }
 
-/// Load `examples/icon.png` (RGBA) and convert it into a `tray_icon::Icon`.
-/// Falls back to a generated blue square if the file cannot be found/decoded.
-fn load_icon() -> tray_icon::Icon {
-    let candidates: Vec<PathBuf> = {
-        let mut list = vec![PathBuf::from("examples/icon.png")];
-        if let Ok(exe) = std::env::current_exe() {
-            if let Some(dir) = exe.parent() {
-                let mut p = dir.to_path_buf();
-                p.push("examples/icon.png");
-                list.push(p);
-                let mut p2 = dir.to_path_buf();
-                p2.push("icon.png");
-                list.push(p2);
-            }
-        }
-        list
-    };
+/// Decode raw RGBA image bytes (PNG/JPEG/…) into a `tray_icon::Icon`.
+/// Returns `None` if the bytes cannot be decoded.
+fn icon_from_bytes(bytes: &[u8]) -> Option<tray_icon::Icon> {
+    let img = image::load_from_memory(bytes).ok()?;
+    let rgba = img.into_rgba8();
+    let (w, h) = (rgba.width(), rgba.height());
+    tray_icon::Icon::from_rgba(rgba.into_raw(), w, h).ok()
+}
 
+/// Build the tray icon. The real icon is **embedded in the binary** via
+/// `include_bytes!`, so the released executable shows the correct icon no
+/// matter where it is launched from. File-system paths are only consulted as
+/// a dev convenience, and a generated square is the last-resort fallback.
+fn load_icon() -> tray_icon::Icon {
+    // 1) Embedded icon – always available in the compiled binary.
+    match icon_from_bytes(include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/icon.png"))) {
+        Some(icon) => {
+            tracing::info!("loaded embedded tray icon");
+            return icon;
+        }
+        None => tracing::warn!("embedded icon.png failed to decode – trying files"),
+    }
+
+    // 2) File paths next to the executable / CWD (dev convenience).
+    let mut candidates: Vec<PathBuf> = vec![PathBuf::from("examples/icon.png")];
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let mut p = dir.to_path_buf();
+            p.push("examples/icon.png");
+            candidates.push(p);
+            let mut p2 = dir.to_path_buf();
+            p2.push("icon.png");
+            candidates.push(p2);
+        }
+    }
     for path in candidates {
-        if let Ok(img) = image::open(&path) {
-            let rgba = img.into_rgba8();
-            let (w, h) = (rgba.width(), rgba.height());
-            if let Ok(icon) = tray_icon::Icon::from_rgba(rgba.into_raw(), w, h) {
+        if let Ok(bytes) = std::fs::read(&path) {
+            if let Some(icon) = icon_from_bytes(&bytes) {
                 tracing::info!("loaded tray icon from {}", path.display());
                 return icon;
             }
         }
     }
 
+    // 3) Last-resort fallback: a generated solid square.
     tracing::warn!("icon.png not found – using generated fallback icon");
     let size = 32u32;
     let mut rgba = Vec::with_capacity((size * size * 4) as usize);
