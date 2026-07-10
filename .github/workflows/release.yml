@@ -36,34 +36,37 @@ jobs:
             my-tray-app-windows-x86_64.exe.sha256
 
   # ----------------------------------------------------------------- macOS
+  # macOS runners are now ARM-only, so we cross-compile BOTH targets on a
+  # single macos-latest (aarch64) job using the universal macOS SDK.
   macos:
     runs-on: macos-latest
-    strategy:
-      matrix:
-        target:
-          - x86_64-apple-darwin
-          - aarch64-apple-darwin
     steps:
       - uses: actions/checkout@v4
-      - name: Set up Rust (${{ matrix.target }})
+      - name: Set up Rust (universal macOS targets)
         uses: dtolnay/rust-toolchain@v1
         with:
           toolchain: stable
-          targets: ${{ matrix.target }}
+          targets: x86_64-apple-darwin,aarch64-apple-darwin
       - name: Build
-        run: cargo build --release --target ${{ matrix.target }}
-      - name: Rename artifact
-        run: mv target/${{ matrix.target }}/release/my-tray-app my-tray-app-macos-${{ matrix.target }}
+        run: |
+          cargo build --release --target x86_64-apple-darwin
+          cargo build --release --target aarch64-apple-darwin
         shell: bash
-      - name: SHA256
-        run: shasum -a 256 my-tray-app-macos-${{ matrix.target }} > my-tray-app-macos-${{ matrix.target }}.sha256
+      - name: Rename + SHA256
+        run: |
+          mv target/x86_64-apple-darwin/release/my-tray-app my-tray-app-macos-x86_64
+          mv target/aarch64-apple-darwin/release/my-tray-app my-tray-app-macos-aarch64
+          shasum -a 256 my-tray-app-macos-x86_64 > my-tray-app-macos-x86_64.sha256
+          shasum -a 256 my-tray-app-macos-aarch64 > my-tray-app-macos-aarch64.sha256
         shell: bash
       - name: Upload release assets
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            my-tray-app-macos-${{ matrix.target }}
-            my-tray-app-macos-${{ matrix.target }}.sha256
+            my-tray-app-macos-x86_64
+            my-tray-app-macos-x86_64.sha256
+            my-tray-app-macos-aarch64
+            my-tray-app-macos-aarch64.sha256
 
   # ----------------------------------------------------------------- Linux
   linux:

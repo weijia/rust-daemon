@@ -140,7 +140,7 @@ fn build_tray_icon(cmd_tx: Sender<AppCommand>) -> tray_icon::TrayIcon {
 
 /// Load `examples/icon.png` (RGBA) and convert it into a `tray_icon::Icon`.
 /// Falls back to a generated blue square if the file cannot be found/decoded.
-fn load_icon() -> tray_icon::icon::Icon {
+fn load_icon() -> tray_icon::Icon {
     let candidates: Vec<PathBuf> = {
         let mut list = vec![PathBuf::from("examples/icon.png")];
         if let Ok(exe) = std::env::current_exe() {
@@ -160,7 +160,7 @@ fn load_icon() -> tray_icon::icon::Icon {
         if let Ok(img) = image::open(&path) {
             let rgba = img.into_rgba8();
             let (w, h) = (rgba.width(), rgba.height());
-            if let Ok(icon) = tray_icon::icon::Icon::from_rgba(rgba.into_raw(), w, h) {
+            if let Ok(icon) = tray_icon::Icon::from_rgba(rgba.into_raw(), w, h) {
                 tracing::info!("loaded tray icon from {}", path.display());
                 return icon;
             }
@@ -173,7 +173,7 @@ fn load_icon() -> tray_icon::icon::Icon {
     for _ in 0..(size * size) {
         rgba.extend_from_slice(&[70u8, 130u8, 220u8, 255u8]);
     }
-    tray_icon::icon::Icon::from_rgba(rgba, size, size).expect("fallback icon")
+    tray_icon::Icon::from_rgba(rgba, size, size).expect("fallback icon")
 }
 
 fn main() {
@@ -226,7 +226,7 @@ fn main() {
     };
 
     let app_creator: Box<
-        dyn FnOnce(&eframe::CreationContext<'_>) -> Result<Box<dyn eframe::App>, Box<dyn std::error::Error>>,
+        dyn FnOnce(&eframe::CreationContext<'_>) -> Result<Box<dyn eframe::App>, Box<dyn std::error::Error + Send + Sync>>,
     > = {
         let cmd_tx = cmd_tx.clone();
         Box::new(move |_cc: &eframe::CreationContext<'_>| {
