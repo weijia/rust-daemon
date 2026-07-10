@@ -1,0 +1,95 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  # ---------------------------------------------------------------- Windows
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Rust (x86_64-pc-windows-msvc)
+        uses: dtolnay/rust-action@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+      - name: Build
+        run: cargo build --release --target x86_64-pc-windows-msvc
+      - name: Rename artifact
+        run: mv target/x86_64-pc-windows-msvc/release/my-tray-app.exe my-tray-app-windows-x86_64.exe
+        shell: bash
+      - name: SHA256
+        run: sha256sum my-tray-app-windows-x86_64.exe > my-tray-app-windows-x86_64.exe.sha256
+        shell: bash
+      - name: Upload release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            my-tray-app-windows-x86_64.exe
+            my-tray-app-windows-x86_64.exe.sha256
+
+  # ----------------------------------------------------------------- macOS
+  macos:
+    runs-on: macos-latest
+    strategy:
+      matrix:
+        target:
+          - x86_64-apple-darwin
+          - aarch64-apple-darwin
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Rust (${{ matrix.target }})
+        uses: dtolnay/rust-action@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }}
+      - name: Rename artifact
+        run: mv target/${{ matrix.target }}/release/my-tray-app my-tray-app-macos-${{ matrix.target }}
+        shell: bash
+      - name: SHA256
+        run: shasum -a 256 my-tray-app-macos-${{ matrix.target }} > my-tray-app-macos-${{ matrix.target }}.sha256
+        shell: bash
+      - name: Upload release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            my-tray-app-macos-${{ matrix.target }}
+            my-tray-app-macos-${{ matrix.target }}.sha256
+
+  # ----------------------------------------------------------------- Linux
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install GTK + WebKit dev libraries
+        run: |
+          sudo apt-get update
+          # libgtk-3-dev      : tray-icon's GTK3 backend
+          # libappindicator3-dev: required by tray-icon's `gtk` feature on Linux
+          # libwebkit2gtk-4.1-dev: kept for when a WebView is added later
+          sudo apt-get install -y libgtk-3-dev libappindicator3-dev libwebkit2gtk-4.1-dev
+      - name: Set up Rust (x86_64-unknown-linux-gnu)
+        uses: dtolnay/rust-action@stable
+        with:
+          targets: x86_64-unknown-linux-gnu
+      - name: Build
+        run: cargo build --release --target x86_64-unknown-linux-gnu
+      - name: Rename artifact
+        run: mv target/x86_64-unknown-linux-gnu/release/my-tray-app my-tray-app-linux-x86_64
+        shell: bash
+      - name: SHA256
+        run: sha256sum my-tray-app-linux-x86_64 > my-tray-app-linux-x86_64.sha256
+        shell: bash
+      - name: Upload release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            my-tray-app-linux-x86_64
+            my-tray-app-linux-x86_64.sha256
