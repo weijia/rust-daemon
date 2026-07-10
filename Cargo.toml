@@ -6,8 +6,6 @@ rust-version = "1.85"
 description = "A headless system-tray daemon with an Axum HTTP control panel, a TCP listener and a local SQLite store."
 
 [dependencies]
-eframe = "0.31"
-egui = "0.31"
 tokio = { version = "1", features = ["full"] }
 axum = "0.8"
 tray-icon = "0.24"
@@ -30,6 +28,11 @@ features = ["gtk"]
 
 [target.'cfg(target_os = "linux")'.dependencies]
 gtk = "0.18"
+
+# Windows/macOS run a headless `winit` event loop (no window) to pump tray-icon
+# menu events. Linux uses GTK's own loop instead.
+[target.'cfg(not(target_os = "linux"))'.dependencies]
+winit = "0.30"
 
 [profile.release]
 opt-level = 3

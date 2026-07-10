@@ -6,12 +6,14 @@
 //! ------------
 //! * A multi-threaded Tokio runtime hosts the Axum HTTP server (`127.0.0.1:3000`)
 //!   and the TCP control listener (`127.0.0.1:4000`).
-//! * The system tray is the only UI entry point. On Linux the GTK event loop runs
-//!   on its own thread (`gtk::init()` + `gtk::main()`); on Windows/macOS the tray
-//!   icon is built inside the `eframe::run_native` closure.
-//! * The tray menu (and HTTP/TCP handlers) only ever send [`AppCommand`]s through
-//!   a `std::sync::mpsc::Sender`. The eframe main thread drains that receiver inside
-//!   `update()` and is the single owner of the canonical state + the SQLite handle.
+//! * The system tray is the only UI entry point. It is built on the main thread
+//!   and the OS event loop pumps the tray's menu events, which are delivered
+//!   through `tray_icon::menu::MenuEvent::receiver()`.
+//! * A background worker thread owns the canonical state + the SQLite handle and
+//!   drains the tray-menu receiver and the `AppCommand` receiver (from the HTTP /
+//!   TCP handlers) every 100 ms. There is **no GUI window** at all – this is a
+//!   true headless daemon, so there is no eframe/winit window to flash or show
+//!   up in the taskbar, and tray events are handled immediately.
 
 mod commands;
 mod db;
@@ -19,106 +21,84 @@ mod http;
 mod tcp;
 
 use commands::{AppCommand, AppStatus};
-use eframe::egui;
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::mpsc::{channel, Receiver};
+use std::thread;
 use std::time::Duration;
 
-struct TrayApp {
-    cmd_tx: Sender<AppCommand>,
-    cmd_rx: Receiver<AppCommand>,
-    status: AppStatus,
-    db: db::Db,
-    /// Kept alive so the icon is not dropped. On Linux the tray lives on the GTK
-    /// thread instead, so this is `None` there.
-    _tray: Option<tray_icon::TrayIcon>,
-}
-
-impl TrayApp {
-    fn new(cmd_tx: Sender<AppCommand>, cmd_rx: Receiver<AppCommand>, tray: Option<tray_icon::TrayIcon>) -> Self {
-        let db = match db::Db::open() {
-            Ok(db) => db,
-            Err(e) => {
-                tracing::error!("failed to open SQLite store: {e}");
-                panic!("SQLite init failed: {e}");
-            }
-        };
-        let task_count = db.count_tasks().unwrap_or(0);
-        Self {
-            cmd_tx,
-            cmd_rx,
-            status: AppStatus {
-                running: false,
-                current_task: None,
-                task_count,
-            },
-            db,
-            _tray: tray,
+/// Drives the canonical state + the SQLite handle, draining both the tray-menu
+/// event receiver and the `AppCommand` receiver (HTTP/TCP handlers) every 100 ms.
+/// Runs on its own thread so it is independent of the OS event loop.
+fn run_worker(rx: Receiver<AppCommand>) {
+    let db = match db::Db::open() {
+        Ok(db) => db,
+        Err(e) => {
+            tracing::error!("failed to open SQLite store: {e}");
+            std::process::exit(1);
         }
-    }
-}
+    };
+    let mut status = AppStatus {
+        running: false,
+        current_task: None,
+        task_count: db.count_tasks().unwrap_or(0),
+    };
 
-impl eframe::App for TrayApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // ---- Tray menu events (global receiver, cross-platform) ----
+    tracing::info!("worker thread started; draining tray-menu + command channels");
+    loop {
+        // ---- Tray menu events (pumped by the OS event loop on the main thread) ----
         while let Ok(event) = tray_icon::menu::MenuEvent::receiver().try_recv() {
             match event.id.as_ref() {
-                "start" => {
-                    let _ = self.cmd_tx.send(AppCommand::StartTask("menu".to_string()));
-                }
-                "stop" => {
-                    let _ = self.cmd_tx.send(AppCommand::StopTask);
-                }
+                "start" => apply_start(&mut status, &db, "menu"),
+                "stop" => apply_stop(&mut status),
                 "quit" => {
                     tracing::info!("quit requested from tray menu");
+                    // Process exits immediately; the OS removes the tray icon.
                     std::process::exit(0);
                 }
                 other => tracing::debug!("ignored menu event: {other}"),
             }
         }
 
-        // ---- Tray icon events (e.g. left click) – drained, currently unused ----
-        while let Ok(_event) = tray_icon::TrayIconEvent::receiver().try_recv() {}
-
         // ---- Commands from HTTP / TCP handlers ----
-        while let Ok(cmd) = self.cmd_rx.try_recv() {
+        while let Ok(cmd) = rx.try_recv() {
             match cmd {
-                AppCommand::StartTask(name) => {
-                    self.status.running = true;
-                    self.status.current_task = Some(name.clone());
-                    if let Err(e) = self.db.insert_task(&name) {
-                        tracing::warn!("failed to persist task '{name}': {e}");
-                    }
-                    self.status.task_count = self.db.count_tasks().unwrap_or(self.status.task_count);
-                    tracing::info!("task started: {name}");
-                }
-                AppCommand::StopTask => {
-                    self.status.running = false;
-                    self.status.current_task = None;
-                    tracing::info!("task stopped");
-                }
+                AppCommand::StartTask(name) => apply_start(&mut status, &db, &name),
+                AppCommand::StopTask => apply_stop(&mut status),
                 AppCommand::GetStatus { respond_to } => {
-                    let _ = respond_to.send(self.status.clone());
+                    let _ = respond_to.send(status.clone());
                 }
                 AppCommand::ListTasks { respond_to } => {
-                    let rows = self.db.list_tasks().unwrap_or_default();
-                    let _ = respond_to.send(rows);
+                    let _ = respond_to.send(db.list_tasks().unwrap_or_default());
                 }
             }
         }
 
-        // There is no window to repaint, but we must keep the event loop ticking
-        // so the receivers above are drained regularly.
-        ctx.request_repaint_after(Duration::from_millis(100));
+        thread::sleep(Duration::from_millis(100));
     }
+}
+
+fn apply_start(status: &mut AppStatus, db: &db::Db, name: &str) {
+    status.running = true;
+    status.current_task = Some(name.to_string());
+    if let Err(e) = db.insert_task(name) {
+        tracing::warn!("failed to persist task '{name}': {e}");
+    }
+    status.task_count = db.count_tasks().unwrap_or(status.task_count);
+    tracing::info!("task started: {name}");
+}
+
+fn apply_stop(status: &mut AppStatus) {
+    status.running = false;
+    status.current_task = None;
+    tracing::info!("task stopped");
 }
 
 /// Build the tray icon + right-click menu. Returns the owned `TrayIcon`.
 ///
-/// On Linux this must be called from the GTK thread (after `gtk::init()`);
-/// on Windows/macOS it is called from the eframe closure on the main thread.
-fn build_tray_icon(cmd_tx: Sender<AppCommand>) -> tray_icon::TrayIcon {
+/// Must be called on the OS main/UI thread (the same thread that runs the
+/// event loop), because the underlying platform menus require it.
+fn build_tray_icon() -> tray_icon::TrayIcon {
     use tray_icon::menu::{Menu, MenuItem};
 
     let mut menu = Menu::new();
@@ -225,44 +205,35 @@ fn main() {
         tcp::run_listener(tcp_tx, addr).await;
     });
 
-    // ---- Tray icon ----
+    // ---- Worker thread: owns state + drains channels ----
+    thread::spawn(move || run_worker(cmd_rx));
+
+    tracing::info!("starting my-tray-app (headless tray daemon)");
+
+    // ---- Build the tray + run the OS event loop on the main thread ----
     #[cfg(target_os = "linux")]
     {
         // GTK must live on its own thread; winit/egui must NOT initialise GTK.
-        let tx = cmd_tx.clone();
-        std::thread::spawn(move || {
-            gtk::init().expect("failed to initialise GTK");
-            let _tray = build_tray_icon(tx);
-            gtk::main();
-        });
+        gtk::init().expect("failed to initialise GTK");
+        let _tray = build_tray_icon();
+        gtk::main();
     }
-
-    let native_options = eframe::NativeOptions {
-        // No visible main window – the tray is the only UI.
-        viewport: egui::ViewportBuilder::default().with_visible(false),
-        ..Default::default()
-    };
-
-    let app_creator: Box<
-        dyn FnOnce(&eframe::CreationContext<'_>) -> Result<Box<dyn eframe::App>, Box<dyn std::error::Error + Send + Sync>>,
-    > = {
-        let cmd_tx = cmd_tx.clone();
-        Box::new(move |_cc: &eframe::CreationContext<'_>| {
-            // On Windows/macOS build the tray here, on the eframe thread.
-            // On Linux the tray already lives on the dedicated GTK thread.
-            #[cfg(not(target_os = "linux"))]
-            let tray = Some(build_tray_icon(cmd_tx.clone()));
-            #[cfg(target_os = "linux")]
-            let tray: Option<tray_icon::TrayIcon> = None;
-
-            Ok(Box::new(TrayApp::new(cmd_tx.clone(), cmd_rx, tray))
-                as Box<dyn eframe::App>)
-        })
-    };
-
-    tracing::info!("starting my-tray-app (headless tray daemon)");
-    if let Err(e) = eframe::run_native("my-tray-app", native_options, app_creator) {
-        tracing::error!("eframe exited with error: {e}");
-        std::process::exit(1);
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _tray = build_tray_icon();
+        run_os_loop();
     }
+}
+
+/// Pump the OS event loop (Windows / macOS) without ever creating a window.
+/// `tray_icon` delivers menu events through this loop to `MenuEvent::receiver()`.
+#[cfg(not(target_os = "linux"))]
+fn run_os_loop() {
+    use winit::event_loop::EventLoop;
+    let event_loop = EventLoop::builder()
+        .build()
+        .expect("failed to build event loop");
+    // No window is created – we only need the loop running so the platform can
+    // dispatch tray-icon's menu messages. `run` blocks until the process exits.
+    let _ = event_loop.run(|_event, _target| {});
 }
